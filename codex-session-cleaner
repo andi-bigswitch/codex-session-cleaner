@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Remove OpenAI-incompatible encrypted reasoning items from a Codex session."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Any, BinaryIO
+
+
+DEFAULT_COMPATIBLE_PREFIXES = ("gAAA",)
+
+
+class CleanerError(RuntimeError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Remove encrypted reasoning blocks that are incompatible with OpenAI "
+            "GPT sessions while preserving the session ID and file name."
+        )
+    )
+    parser.add_argument(
+        "session",
+        help="Codex session UUID, or 'last' for the most recently used session",
+    )
+    return parser.parse_args()
+
+
+def normalize_session_id(raw: str) -> str:
+    try:
+        return str(uuid.UUID(raw))
+    except ValueError as exc:
+        raise CleanerError(f"Invalid session ID: {raw}") from exc
+
+
+def sessions_root() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    root = codex_home.expanduser() / "sessions"
+    if not root.is_dir():
+        raise CleanerError(f"Session directory not found: {root}")
+    return root
+
+
+def find_session(root: Path, session_id: str) -> Path:
+    suffix = f"-{session_id}.jsonl"
+    matches = sorted(
+        path
+        for path in root.rglob("*.jsonl")
+        if path.name.endswith(suffix) and path.is_file() and not path.is_symlink()
+    )
+    if not matches:
+        raise CleanerError(f"No session with ID {session_id} found under {root}")
+    if len(matches) > 1:
+        rendered = "\n  ".join(str(path) for path in matches)
+        raise CleanerError(
+            f"Multiple sessions with ID {session_id} found:\n  {rendered}"
+        )
+    return matches[0]
+
+
+def find_last_session(root: Path) -> Path:
+    candidates: list[tuple[int, str, Path]] = []
+    for path in root.rglob("*.jsonl"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            modified = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+        candidates.append((modified, str(path), path))
+
+    if not candidates:
+        raise CleanerError(f"No sessions found under {root}")
+    return max(candidates)[2]
+
+
+def read_session_id(path: Path) -> str:
+    try:
+        with path.open("rb") as source:
+            first_line = source.readline()
+        record = json.loads(first_line)
+        session_id = record["payload"]["id"]
+    except (OSError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CleanerError(f"Could not read the session ID from {path}") from exc
+    return normalize_session_id(session_id)
+
+
+def resolve_session(root: Path, selector: str) -> tuple[Path, str]:
+    if selector == "last":
+        path = find_last_session(root)
+        return path, read_session_id(path)
+    session_id = normalize_session_id(selector)
+    return find_session(root, session_id), session_id
+
+
+def is_incompatible_reasoning(value: Any, prefixes: tuple[str, ...]) -> bool:
+    if not isinstance(value, dict) or value.get("type") != "reasoning":
+        return False
+    encrypted = value.get("encrypted_content")
+    return isinstance(encrypted, str) and not encrypted.startswith(prefixes)
+
+
+def is_incompatible_response_item(value: Any, prefixes: tuple[str, ...]) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("type") == "response_item"
+        and is_incompatible_reasoning(value.get("payload"), prefixes)
+    )
+
+
+def clean_nested(value: Any, prefixes: tuple[str, ...]) -> tuple[Any, int, bool]:
+    """Remove incompatible reasoning records nested in compacted history arrays."""
+    if isinstance(value, list):
+        cleaned_items: list[Any] = []
+        removed = 0
+        changed = False
+        for item in value:
+            if is_incompatible_reasoning(item, prefixes) or is_incompatible_response_item(
+                item, prefixes
+            ):
+                removed += 1
+                changed = True
+                continue
+            cleaned, nested_removed, nested_changed = clean_nested(item, prefixes)
+            cleaned_items.append(cleaned)
+            removed += nested_removed
+            changed = changed or nested_changed
+        return cleaned_items if changed else value, removed, changed
+
+    if isinstance(value, dict):
+        cleaned_dict: dict[str, Any] = {}
+        removed = 0
+        changed = False
+        for key, item in value.items():
+            cleaned, nested_removed, nested_changed = clean_nested(item, prefixes)
+            cleaned_dict[key] = cleaned
+            removed += nested_removed
+            changed = changed or nested_changed
+        return cleaned_dict if changed else value, removed, changed
+
+    return value, 0, False
+
+
+def stable_signature(info: os.stat_result) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def assert_unchanged(path: Path, initial: os.stat_result) -> None:
+    current = path.stat()
+    if stable_signature(current) != stable_signature(initial):
+        raise CleanerError(
+            "The session changed while it was being cleaned. Stop Codex for this "
+            "session and try again."
+        )
+
+
+def process_stream(
+    source: BinaryIO,
+    target: BinaryIO | None,
+    path: Path,
+    prefixes: tuple[str, ...],
+) -> int:
+    removed = 0
+    for line_number, raw_line in enumerate(source, start=1):
+        try:
+            record = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CleanerError(
+                f"Invalid JSONL in {path}, line {line_number}: {exc}"
+            ) from exc
+
+        if is_incompatible_response_item(record, prefixes):
+            removed += 1
+            continue
+
+        cleaned, nested_removed, changed = clean_nested(record, prefixes)
+        removed += nested_removed
+        if target is None:
+            continue
+        if changed:
+            encoded = json.dumps(
+                cleaned,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            target.write(encoded + b"\n")
+        else:
+            target.write(raw_line)
+    return removed
+
+
+def clean_session(path: Path) -> int:
+    initial = path.stat()
+    temp_name: str | None = None
+
+    try:
+        with path.open("rb") as source, tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.clean-",
+            suffix=".tmp",
+            delete=False,
+        ) as target:
+            temp_name = target.name
+            removed = process_stream(
+                source,
+                target,
+                path,
+                DEFAULT_COMPATIBLE_PREFIXES,
+            )
+
+            target.flush()
+            os.fsync(target.fileno())
+
+        assert_unchanged(path, initial)
+
+        if removed == 0:
+            os.unlink(temp_name)
+            temp_name = None
+            return removed
+
+        os.chmod(temp_name, stat.S_IMODE(initial.st_mode))
+        os.utime(
+            temp_name,
+            ns=(initial.st_atime_ns, initial.st_mtime_ns),
+        )
+
+        os.replace(temp_name, path)
+        temp_name = None
+
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+        return removed
+    except Exception:
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        root = sessions_root()
+        path, session_id = resolve_session(root, args.session)
+
+        print(f"Session file: {path.name}")
+        print(f"Session ID: {session_id}")
+        removed = clean_session(path)
+
+        if removed == 0:
+            print("Already compatible: no incompatible reasoning blocks found.")
+        else:
+            noun = "block" if removed == 1 else "blocks"
+            print(f"Cleaned: removed {removed} incompatible reasoning {noun}.")
+            print("The session ID and file name were preserved.")
+        return 0
+    except (CleanerError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

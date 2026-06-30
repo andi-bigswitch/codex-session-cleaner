@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -37,6 +39,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help=(
+            "Do not create a backup under "
+            "${CODEX_HOME:-~/.codex}/session-cleaner-backups before replacing "
+            "a changed session."
+        ),
+    )
+    parser.add_argument(
         "session",
         help="Codex session UUID, or 'last' for the most recently used session",
     )
@@ -50,12 +61,19 @@ def normalize_session_id(raw: str) -> str:
         raise CleanerError(f"Invalid session ID: {raw}") from exc
 
 
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+
+
 def sessions_root() -> Path:
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    root = codex_home.expanduser() / "sessions"
+    root = codex_home() / "sessions"
     if not root.is_dir():
         raise CleanerError(f"Session directory not found: {root}")
     return root
+
+
+def default_backup_root(root: Path) -> Path:
+    return root.parent / "session-cleaner-backups"
 
 
 def find_session(root: Path, session_id: str) -> Path:
@@ -177,6 +195,75 @@ def assert_unchanged(path: Path, initial: os.stat_result) -> None:
         )
 
 
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def unique_backup_path(path: Path, root: Path, backup_root: Path) -> Path:
+    try:
+        relative_path = path.relative_to(root)
+    except ValueError as exc:
+        raise CleanerError(
+            f"Session file is not under session directory: {path}"
+        ) from exc
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = backup_root / relative_path.parent
+    backup_path = backup_dir / f"{relative_path.name}.{timestamp}.bak"
+    counter = 1
+    while backup_path.exists():
+        backup_path = backup_dir / f"{relative_path.name}.{timestamp}.{counter}.bak"
+        counter += 1
+    return backup_path
+
+
+def create_backup(
+    path: Path,
+    root: Path,
+    backup_root: Path,
+    initial: os.stat_result,
+) -> Path:
+    backup_path = unique_backup_path(path, root, backup_root)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path: Path | None = None
+    try:
+        with path.open("rb") as source, tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=backup_path.parent,
+            prefix=".backup-",
+            suffix=".tmp",
+            delete=False,
+        ) as target:
+            temp_path = Path(target.name)
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+
+        assert_unchanged(path, initial)
+
+        os.chmod(temp_path, stat.S_IMODE(initial.st_mode))
+        os.utime(
+            temp_path,
+            ns=(initial.st_atime_ns, initial.st_mtime_ns),
+        )
+        os.replace(temp_path, backup_path)
+        temp_path = None
+        fsync_directory(backup_path.parent)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    return backup_path
+
+
 def process_stream(
     source: BinaryIO,
     target: BinaryIO | None,
@@ -212,9 +299,15 @@ def process_stream(
     return removed
 
 
-def clean_session(path: Path, prefixes: tuple[str, ...]) -> int:
+def clean_session(
+    path: Path,
+    root: Path,
+    prefixes: tuple[str, ...],
+    backup_root: Path | None,
+) -> tuple[int, Path | None]:
     initial = path.stat()
-    temp_name: str | None = None
+    temp_path: Path | None = None
+    backup_path: Path | None = None
 
     try:
         with path.open("rb") as source, tempfile.NamedTemporaryFile(
@@ -224,7 +317,7 @@ def clean_session(path: Path, prefixes: tuple[str, ...]) -> int:
             suffix=".tmp",
             delete=False,
         ) as target:
-            temp_name = target.name
+            temp_path = Path(target.name)
             removed = process_stream(source, target, path, prefixes)
 
             target.flush()
@@ -233,33 +326,38 @@ def clean_session(path: Path, prefixes: tuple[str, ...]) -> int:
         assert_unchanged(path, initial)
 
         if removed == 0:
-            os.unlink(temp_name)
-            temp_name = None
-            return removed
+            temp_path.unlink()
+            temp_path = None
+            return removed, None
 
-        os.chmod(temp_name, stat.S_IMODE(initial.st_mode))
+        if backup_root is not None:
+            backup_path = create_backup(path, root, backup_root, initial)
+            try:
+                assert_unchanged(path, initial)
+            except CleanerError:
+                try:
+                    backup_path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+
+        os.chmod(temp_path, stat.S_IMODE(initial.st_mode))
         os.utime(
-            temp_name,
+            temp_path,
             ns=(initial.st_atime_ns, initial.st_mtime_ns),
         )
 
-        os.replace(temp_name, path)
-        temp_name = None
+        os.replace(temp_path, path)
+        temp_path = None
+        fsync_directory(path.parent)
 
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-
-        return removed
-    except Exception:
-        if temp_name is not None:
+        return removed, backup_path
+    finally:
+        if temp_path is not None:
             try:
-                os.unlink(temp_name)
+                temp_path.unlink()
             except FileNotFoundError:
                 pass
-        raise
 
 
 def main() -> int:
@@ -267,16 +365,24 @@ def main() -> int:
     try:
         root = sessions_root()
         path, session_id = resolve_session(root, args.session)
+        backup_root = None if args.no_backup else default_backup_root(root)
 
         print(f"Session file: {path.name}")
         print(f"Session ID: {session_id}")
-        removed = clean_session(path, compatible_prefixes(args))
+        removed, backup_path = clean_session(
+            path,
+            root,
+            compatible_prefixes(args),
+            backup_root,
+        )
 
         if removed == 0:
             print("Already compatible: no incompatible reasoning blocks found.")
         else:
             noun = "block" if removed == 1 else "blocks"
             print(f"Cleaned: removed {removed} incompatible reasoning {noun}.")
+            if backup_path is not None:
+                print(f"Backup: {backup_path}")
             print("The session ID and file name were preserved.")
         return 0
     except (CleanerError, OSError) as exc:

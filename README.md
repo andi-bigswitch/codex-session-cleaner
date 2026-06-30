@@ -9,6 +9,8 @@ history. A different provider cannot decrypt that hidden state, so replaying
 the same session can fail with `invalid_encrypted_content`. This tool removes
 the incompatible encrypted reasoning records while preserving the visible
 conversation, tool records, session ID, file name, permissions, and timestamp.
+When a session is changed, the original JSONL file is backed up before the
+cleaned file replaces it.
 
 This is an unofficial workaround for
 [openai/codex#17541](https://github.com/openai/codex/issues/17541).
@@ -65,10 +67,32 @@ encrypted reasoning records:
 codex-session-cleaner --remove-all-encrypted 019dc8d9-3ff9-7f23-bb45-54818d3b3d9c
 ```
 
+By default, changed sessions are backed up under
+`${CODEX_HOME:-~/.codex}/session-cleaner-backups`, preserving the relative path
+from the `sessions` directory and appending a UTC timestamp to the file name.
+For example, a session stored at:
+
+```text
+~/.codex/sessions/2026/06/27/rollout-test-019dc8d9-3ff9-7f23-bb45-54818d3b3d9c.jsonl
+```
+
+gets a backup like:
+
+```text
+~/.codex/session-cleaner-backups/2026/06/27/rollout-test-019dc8d9-3ff9-7f23-bb45-54818d3b3d9c.jsonl.20260630T120000Z.bak
+```
+
+Skip backup creation when you have made your own copy:
+
+```bash
+codex-session-cleaner --no-backup 019dc8d9-3ff9-7f23-bb45-54818d3b3d9c
+```
+
 ## Safety and limitations
 
-- Back up the affected JSONL file before running the tool. The cleaner does
-  not create backups.
+- Changed sessions are backed up before replacement unless `--no-backup` is
+  used. Backups are stored outside `sessions`, so they are not considered
+  resumable Codex sessions.
 - Do not run it while Codex is writing to the session. It detects concurrent
   changes and aborts, but closing the session first is still required.
 - Every JSONL record is validated before the original file is replaced.

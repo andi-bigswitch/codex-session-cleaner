@@ -49,6 +49,7 @@ class CleanerIntegrationTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.codex_home = Path(self.temp_dir.name)
         self.sessions = self.codex_home / "sessions" / "2026" / "06" / "27"
+        self.backups = self.codex_home / "session-cleaner-backups"
         self.sessions.mkdir(parents=True)
         self.env = os.environ.copy()
         self.env["CODEX_HOME"] = str(self.codex_home)
@@ -77,6 +78,11 @@ class CleanerIntegrationTests(unittest.TestCase):
 
     def read_records(self, path: Path) -> list[dict]:
         return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def backup_paths(self) -> list[Path]:
+        if not self.backups.exists():
+            return []
+        return sorted(path for path in self.backups.rglob("*.bak") if path.is_file())
 
     def test_cleans_top_level_and_compacted_reasoning(self) -> None:
         session_id = "11111111-1111-4111-8111-111111111111"
@@ -108,7 +114,11 @@ class CleanerIntegrationTests(unittest.TestCase):
         result = self.run_cleaner(session_id)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Cleaned: removed 3 incompatible reasoning blocks.", result.stdout)
+        self.assertIn(
+            "Cleaned: removed 3 incompatible reasoning blocks.",
+            result.stdout,
+        )
+        self.assertIn("Backup:", result.stdout)
         records = self.read_records(path)
         serialized = json.dumps(records)
         self.assertNotIn("fugu-state", serialized)
@@ -119,6 +129,45 @@ class CleanerIntegrationTests(unittest.TestCase):
         self.assertEqual(records[0]["payload"]["id"], session_id)
         self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
         self.assertEqual(list(self.sessions.glob("*.bak*")), [])
+        backups = self.backup_paths()
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].parent, self.backups / "2026" / "06" / "27")
+        backup_text = backups[0].read_text()
+        self.assertIn("fugu-state", backup_text)
+        self.assertIn("gAAAA-openai-state", backup_text)
+        self.assertEqual(backups[0].stat().st_mtime_ns, mtime_ns)
+
+    def test_no_backup_skips_backup_for_changed_session(self) -> None:
+        session_id = "66666666-6666-4666-8666-666666666666"
+        path = self.write_session(
+            session_id,
+            [session_meta(session_id), encrypted_reasoning("fugu-state")],
+            1_780_000_000_123_456_789,
+        )
+
+        result = self.run_cleaner("--no-backup", session_id)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Backup:", result.stdout)
+        self.assertNotIn("fugu-state", path.read_text())
+        self.assertEqual(self.backup_paths(), [])
+
+    def test_already_compatible_session_does_not_create_backup(self) -> None:
+        session_id = "77777777-7777-4777-8777-777777777777"
+        self.write_session(
+            session_id,
+            [session_meta(session_id), encrypted_reasoning("gAAAA-openai-state")],
+            1_780_000_000_123_456_789,
+        )
+
+        result = self.run_cleaner(session_id)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Already compatible: no incompatible reasoning blocks found.",
+            result.stdout,
+        )
+        self.assertEqual(self.backup_paths(), [])
 
     def test_remove_all_encrypted_removes_compatible_prefixes(self) -> None:
         session_id = "55555555-5555-4555-8555-555555555555"
@@ -190,6 +239,7 @@ class CleanerIntegrationTests(unittest.TestCase):
         self.assertIn("Invalid JSONL", result.stderr)
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(list(self.sessions.glob(".*.tmp")), [])
+        self.assertEqual(self.backup_paths(), [])
 
 
 if __name__ == "__main__":

@@ -29,6 +29,14 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
+        "--remove-all-encrypted",
+        action="store_true",
+        help=(
+            "Remove all encrypted reasoning blocks, including blocks whose "
+            "ciphertext starts with a normally compatible prefix."
+        ),
+    )
+    parser.add_argument(
         "session",
         help="Codex session UUID, or 'last' for the most recently used session",
     )
@@ -100,6 +108,12 @@ def resolve_session(root: Path, selector: str) -> tuple[Path, str]:
         return path, read_session_id(path)
     session_id = normalize_session_id(selector)
     return find_session(root, session_id), session_id
+
+
+def compatible_prefixes(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.remove_all_encrypted:
+        return ()
+    return DEFAULT_COMPATIBLE_PREFIXES
 
 
 def is_incompatible_reasoning(value: Any, prefixes: tuple[str, ...]) -> bool:
@@ -198,7 +212,7 @@ def process_stream(
     return removed
 
 
-def clean_session(path: Path) -> int:
+def clean_session(path: Path, prefixes: tuple[str, ...]) -> int:
     initial = path.stat()
     temp_name: str | None = None
 
@@ -211,12 +225,7 @@ def clean_session(path: Path) -> int:
             delete=False,
         ) as target:
             temp_name = target.name
-            removed = process_stream(
-                source,
-                target,
-                path,
-                DEFAULT_COMPATIBLE_PREFIXES,
-            )
+            removed = process_stream(source, target, path, prefixes)
 
             target.flush()
             os.fsync(target.fileno())
@@ -261,7 +270,7 @@ def main() -> int:
 
         print(f"Session file: {path.name}")
         print(f"Session ID: {session_id}")
-        removed = clean_session(path)
+        removed = clean_session(path, compatible_prefixes(args))
 
         if removed == 0:
             print("Already compatible: no incompatible reasoning blocks found.")

@@ -20,7 +20,7 @@ def session_meta(session_id: str) -> dict:
     }
 
 
-def incompatible_reasoning(ciphertext: str = "fugu-encrypted-state") -> dict:
+def encrypted_reasoning(ciphertext: str = "encrypted-state") -> dict:
     return {
         "timestamp": "2026-06-27T00:00:01Z",
         "type": "response_item",
@@ -28,18 +28,6 @@ def incompatible_reasoning(ciphertext: str = "fugu-encrypted-state") -> dict:
             "type": "reasoning",
             "summary": [],
             "encrypted_content": ciphertext,
-        },
-    }
-
-
-def compatible_reasoning() -> dict:
-    return {
-        "timestamp": "2026-06-27T00:00:02Z",
-        "type": "response_item",
-        "payload": {
-            "type": "reasoning",
-            "summary": [],
-            "encrypted_content": "gAAAA-openai-state",
         },
     }
 
@@ -78,9 +66,9 @@ class CleanerIntegrationTests(unittest.TestCase):
         os.utime(path, ns=(mtime_ns, mtime_ns))
         return path
 
-    def run_cleaner(self, selector: str) -> subprocess.CompletedProcess[str]:
+    def run_cleaner(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(SCRIPT), selector],
+            [str(SCRIPT), *args],
             env=self.env,
             text=True,
             capture_output=True,
@@ -97,9 +85,9 @@ class CleanerIntegrationTests(unittest.TestCase):
             "type": "compacted",
             "payload": {
                 "replacement_history": [
-                    incompatible_reasoning("nested-fugu-state")["payload"],
-                    incompatible_reasoning("wrapped-fugu-state"),
-                    compatible_reasoning()["payload"],
+                    encrypted_reasoning("nested-fugu-state")["payload"],
+                    encrypted_reasoning("wrapped-fugu-state"),
+                    encrypted_reasoning("gAAAA-nested-state")["payload"],
                     visible_message("nested visible message")["payload"],
                 ]
             },
@@ -109,8 +97,8 @@ class CleanerIntegrationTests(unittest.TestCase):
             session_id,
             [
                 session_meta(session_id),
-                incompatible_reasoning(),
-                compatible_reasoning(),
+                encrypted_reasoning("fugu-state"),
+                encrypted_reasoning("gAAAA-openai-state"),
                 visible_message(),
                 compacted,
             ],
@@ -125,23 +113,56 @@ class CleanerIntegrationTests(unittest.TestCase):
         serialized = json.dumps(records)
         self.assertNotIn("fugu-state", serialized)
         self.assertIn("gAAAA-openai-state", serialized)
+        self.assertIn("gAAAA-nested-state", serialized)
         self.assertIn("keep me", serialized)
         self.assertIn("nested visible message", serialized)
         self.assertEqual(records[0]["payload"]["id"], session_id)
         self.assertEqual(path.stat().st_mtime_ns, mtime_ns)
         self.assertEqual(list(self.sessions.glob("*.bak*")), [])
 
+    def test_remove_all_encrypted_removes_compatible_prefixes(self) -> None:
+        session_id = "55555555-5555-4555-8555-555555555555"
+        compacted = {
+            "timestamp": "2026-06-27T00:00:04Z",
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    encrypted_reasoning("gAAAA-nested-state")["payload"],
+                    visible_message("nested visible message")["payload"],
+                ]
+            },
+        }
+        path = self.write_session(
+            session_id,
+            [
+                session_meta(session_id),
+                encrypted_reasoning("gAAAA-openai-state"),
+                visible_message(),
+                compacted,
+            ],
+            1_780_000_000_123_456_789,
+        )
+
+        result = self.run_cleaner("--remove-all-encrypted", session_id)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Cleaned: removed 2 incompatible reasoning blocks.", result.stdout)
+        serialized = json.dumps(self.read_records(path))
+        self.assertNotIn("gAAAA", serialized)
+        self.assertIn("keep me", serialized)
+        self.assertIn("nested visible message", serialized)
+
     def test_last_selects_the_most_recent_session(self) -> None:
         old_id = "22222222-2222-4222-8222-222222222222"
         new_id = "33333333-3333-4333-8333-333333333333"
         old_path = self.write_session(
             old_id,
-            [session_meta(old_id), incompatible_reasoning("old-fugu-state")],
+            [session_meta(old_id), encrypted_reasoning("old-fugu-state")],
             1_780_000_000_000_000_000,
         )
         new_path = self.write_session(
             new_id,
-            [session_meta(new_id), incompatible_reasoning("new-fugu-state")],
+            [session_meta(new_id), encrypted_reasoning("new-fugu-state")],
             1_780_000_001_000_000_000,
         )
 
@@ -156,7 +177,7 @@ class CleanerIntegrationTests(unittest.TestCase):
         session_id = "44444444-4444-4444-8444-444444444444"
         path = self.write_session(
             session_id,
-            [session_meta(session_id), incompatible_reasoning()],
+            [session_meta(session_id), encrypted_reasoning()],
             1_780_000_000_000_000_000,
         )
         with path.open("a", encoding="utf-8") as target:

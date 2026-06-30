@@ -58,6 +58,13 @@ codex-session-cleaner last
 
 You can then resume the same session ID with your intended OpenAI GPT profile.
 
+If the default compatibility rule is too narrow for the session, remove all
+encrypted reasoning records:
+
+```bash
+codex-session-cleaner --remove-all-encrypted 019dc8d9-3ff9-7f23-bb45-54818d3b3d9c
+```
+
 ## Safety and limitations
 
 - Back up the affected JSONL file before running the tool. The cleaner does
@@ -66,11 +73,10 @@ You can then resume the same session ID with your intended OpenAI GPT profile.
   changes and aborts, but closing the session first is still required.
 - Every JSONL record is validated before the original file is replaced.
 - Replacement is atomic and the original file mode and timestamps are kept.
-- The current compatibility rule keeps encrypted reasoning whose ciphertext
-  starts with `gAAA` and removes other encrypted reasoning records. This is a
-  targeted Sakana-Fugu-to-OpenAI workaround, not a universal repair strategy.
-- It will not fix account or organization-key mismatches when both providers'
-  ciphertext uses the same prefix.
+- The default compatibility rule keeps encrypted reasoning whose ciphertext
+  starts with `gAAA` and removes other encrypted reasoning records.
+- Use `--remove-all-encrypted` when ciphertext prefixes are not a reliable
+  compatibility signal for the target provider, account, or organization.
 - Removing hidden reasoning can reduce model context even though visible
   messages and tool history are preserved.
 
